@@ -1,21 +1,40 @@
 use itertools::*;
 use std::{collections::HashMap, hash::Hash, sync::Arc};
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+use crate::error::ProcessingError;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Stop {
     pub id: String,
 }
 
+impl Stop {
+    pub fn precedes(&self, other: &Stop, route: &Route) -> Result<bool, ProcessingError> {
+        let stops = route.stops();
+        Ok(stops.iter().position(|stop| stop.as_ref() == self).ok_or(
+            ProcessingError::NoStopOnRoute {
+                stop_id: self.id.to_owned(),
+                route_id: route.id(),
+            },
+        )? < stops.iter().position(|stop| stop.as_ref() == other).ok_or(
+            ProcessingError::NoStopOnRoute {
+                stop_id: other.id.to_owned(),
+                route_id: route.id(),
+            },
+        )?)
+    }
+}
+
 pub type Time = u32;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopTime {
     pub stop: Arc<Stop>,
     pub arrival_time: Time,
     pub departure_time: Time,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trip {
     id: String,
     stop_times: Vec<Arc<StopTime>>,
@@ -29,9 +48,35 @@ impl Trip {
                 format!("{}_{}", acc, stop_time.stop.id)
             })
     }
+
+    pub fn stops(&self) -> Vec<Arc<Stop>> {
+        self.stop_times
+            .iter()
+            .map(|stop_time| Arc::clone(&stop_time.stop))
+            .collect()
+    }
+
+    pub fn stop_time(&self, stop: &Stop) -> Result<Arc<StopTime>, ProcessingError> {
+        self.stop_times
+            .iter()
+            .find(|stop_time| stop_time.stop.as_ref() == stop)
+            .cloned()
+            .ok_or(ProcessingError::NoStopOnTrip {
+                stop_id: self.id.to_owned(),
+                trip_id: stop.id.to_owned(),
+            })
+    }
+
+    pub fn arr(&self, stop: &Stop) -> Result<Time, ProcessingError> {
+        Ok(self.stop_time(stop)?.arrival_time)
+    }
+
+    pub fn dep(&self, stop: &Stop) -> Result<Time, ProcessingError> {
+        Ok(self.stop_time(stop)?.departure_time)
+    }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RawRoute {
     pub id: String,
     pub trips: Vec<Arc<Trip>>,
@@ -43,7 +88,7 @@ impl PartialEq for RawRoute {
     }
 }
 
-#[derive(Debug, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct Route {
     pub parent_id: String,
     pub group_id: String,
@@ -53,30 +98,6 @@ pub struct Route {
 impl PartialEq for Route {
     fn eq(&self, other: &Self) -> bool {
         self.id() == other.id()
-    }
-}
-
-impl Trip {
-    pub fn stops(&self) -> Vec<Arc<Stop>> {
-        self.stop_times
-            .iter()
-            .map(|stop_time| Arc::clone(&stop_time.stop))
-            .collect()
-    }
-
-    pub fn stop_time(&self, stop: &Stop) -> Option<Arc<StopTime>> {
-        self.stop_times
-            .iter()
-            .find(|stop_time| stop_time.stop.as_ref() == stop)
-            .cloned()
-    }
-
-    pub fn arr(trip: Option<&Trip>, stop: &Arc<Stop>) -> Option<Time> {
-        Some(trip.as_ref()?.stop_time(stop)?.arrival_time)
-    }
-
-    pub fn dep(trip: Option<&Trip>, stop: &Arc<Stop>) -> Option<Time> {
-        Some(trip.as_ref()?.stop_time(stop)?.departure_time)
     }
 }
 
@@ -125,31 +146,13 @@ impl Hash for Route {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct QueueItem {
     pub route: Arc<Route>,
     pub hop_stop: Arc<Stop>,
 }
 
 impl QueueItem {
-    pub fn precedes(&self, other: &QueueItem) -> Option<bool> {
-        if self.conflicts(other) {
-            let stops = self.route.stops();
-            if let (Some(self_pos), Some(other_pos)) = (
-                stops.iter().position(|stop| stop == &self.hop_stop),
-                stops.iter().position(|stop| stop == &other.hop_stop),
-            ) {
-                return Some(self_pos < other_pos);
-            }
-        }
-
-        None
-    }
-
-    pub fn conflicts(&self, other: &QueueItem) -> bool {
-        self.route == other.route
-    }
-
     pub fn stops(&self) -> Vec<Arc<Stop>> {
         self.route
             .stops()
@@ -171,27 +174,49 @@ impl From<(Arc<Route>, Arc<Stop>)> for QueueItem {
 
 impl From<Queue> for Vec<QueueItem> {
     fn from(value: Queue) -> Self {
-        value
-            .0
-            .into_iter()
-            .map(|pair| QueueItem::from(pair))
-            .collect()
+        value.0.into_iter().map(QueueItem::from).collect()
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Queue(pub HashMap<Arc<Route>, Arc<Stop>>);
 
 impl Queue {
     pub fn insert(&mut self, item: QueueItem) {
         self.0
-            .entry(item.route)
-            .and_modify(|queue_item| *queue_item = Arc::clone(&item.hop_stop))
+            .entry(Arc::clone(&item.route))
+            .and_modify(|queue_entry| {
+                if item
+                    .hop_stop
+                    .precedes(queue_entry.as_ref(), &item.route)
+                    .unwrap()
+                {
+                    *queue_entry = Arc::clone(&item.hop_stop)
+                }
+            })
             .or_insert(item.hop_stop);
     }
 
-    pub fn as_vec(self) -> Vec<QueueItem> {
-        Vec::<QueueItem>::from(self)
+    pub fn as_vec(&self) -> Vec<QueueItem> {
+        Vec::<QueueItem>::from(self.clone())
+    }
+
+    pub fn enqueue(marked_stops: &[Arc<Stop>], routes: &[Arc<Route>]) -> Self {
+        let mut queue = Self::default();
+
+        for marked_stop in marked_stops {
+            for route in routes
+                .iter()
+                .filter(|route| route.stops().contains(marked_stop))
+            {
+                queue.insert(QueueItem {
+                    route: Arc::clone(route),
+                    hop_stop: Arc::clone(marked_stop),
+                })
+            }
+        }
+
+        queue
     }
 }
 
