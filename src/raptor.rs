@@ -1,6 +1,6 @@
 use std::{cmp, collections::HashMap, sync::Arc};
 
-use crate::{data::*, timetable::*};
+use crate::data::*;
 
 pub type Tau = HashMap<Arc<Stop>, Time>;
 

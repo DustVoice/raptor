@@ -1,11 +1,14 @@
 use itertools::*;
 use std::{collections::HashMap, hash::Hash, sync::Arc};
 
-use crate::error::ProcessingError;
+use crate::{error::ProcessingError, gtfs};
+
+pub type Time = u32;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Stop {
     pub id: String,
+    pub name: String,
 }
 
 impl Stop {
@@ -24,8 +27,6 @@ impl Stop {
         )?)
     }
 }
-
-pub type Time = u32;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopTime {
@@ -79,25 +80,13 @@ impl Trip {
 #[derive(Clone, Debug)]
 pub struct RawRoute {
     pub id: String,
+    pub name: String,
     pub trips: Vec<Arc<Trip>>,
 }
 
 impl PartialEq for RawRoute {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
-    }
-}
-
-#[derive(Clone, Debug, Eq)]
-pub struct Route {
-    pub parent_id: String,
-    pub group_id: String,
-    pub trips: Vec<Arc<Trip>>,
-}
-
-impl PartialEq for Route {
-    fn eq(&self, other: &Self) -> bool {
-        self.id() == other.id()
     }
 }
 
@@ -110,12 +99,27 @@ impl RawRoute {
     }
 }
 
+#[derive(Clone, Debug, Eq)]
+pub struct Route {
+    pub parent_id: String,
+    pub parent_name: String,
+    pub group_id: String,
+    pub trips: Vec<Arc<Trip>>,
+}
+
+impl PartialEq for Route {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
 impl From<RawRoute> for Vec<Route> {
     fn from(val: RawRoute) -> Self {
         val.trip_groups()
             .into_iter()
             .map(|(group_id, group)| Route {
                 parent_id: val.id.to_owned(),
+                parent_name: val.name.to_owned(),
                 group_id: group_id.to_owned(),
                 trips: group,
             })
@@ -225,4 +229,131 @@ pub struct Transfer {
     pub from: Arc<Stop>,
     pub to: Arc<Stop>,
     pub time: Time,
+}
+
+#[derive(Debug)]
+pub struct Timetable {
+    pub stops: Vec<Arc<Stop>>,
+    pub routes: Vec<Arc<Route>>,
+    pub trips: Vec<Arc<Trip>>,
+    pub transfers: Vec<Arc<Transfer>>,
+}
+
+impl From<gtfs::Timetable> for Timetable {
+    fn from(value: gtfs::Timetable) -> Self {
+        println!("Converting stops");
+        let stops: Vec<Arc<Stop>> = value
+            .stops
+            .into_iter()
+            .map(|stop| {
+                Arc::new(Stop {
+                    id: stop.stop_id,
+                    name: stop.stop_name,
+                })
+            })
+            .collect();
+
+        let stop_by_id = |id: String, stops: &Vec<Arc<Stop>>| -> Arc<Stop> {
+            Arc::clone(
+                stops
+                    .iter()
+                    .find(|stop| stop.id == id)
+                    .expect("Stop not present in list of stops"),
+            )
+        };
+
+        let time_to_seconds = |time: String| -> u32 {
+            let components: Vec<String> = time.split(':').map(String::from).collect();
+            assert!(components.len() == 3);
+            (components[0].parse::<u32>().unwrap() * 60 * 60)
+                + (components[1].parse::<u32>().unwrap() * 60)
+                + components[2].parse::<u32>().unwrap()
+        };
+
+        println!("Calculating StopTimes-Hashmap");
+        let stop_times_intermed = value
+            .stop_times
+            .iter()
+            .map(|stop_time| {
+                (
+                    stop_time.trip_id.to_owned(),
+                    Arc::new(StopTime {
+                        stop: stop_by_id(stop_time.stop_id.to_owned(), &stops),
+                        arrival_time: time_to_seconds(stop_time.arrival_time.to_owned()),
+                        departure_time: time_to_seconds(stop_time.departure_time.to_owned()),
+                    }),
+                )
+            })
+            .into_group_map();
+
+        println!("Calculating Trips-Hashmap");
+        let trips_intermed =
+            value
+                .trips
+                .iter()
+                .map(|trip| {
+                    (
+                    trip.route_id.to_owned(),
+                    Arc::new(Trip {
+                        id: trip.trip_id.to_owned(),
+                        stop_times: stop_times_intermed.get(&trip.trip_id)
+
+                    .expect("Key corresponding to Trip should be present in StopTimes-Hashmap")
+                    .to_owned(),
+                    }),
+                )
+                })
+                .into_group_map();
+
+        println!("Converting RawRoutes");
+        let raw_routes: Vec<RawRoute> = value
+            .routes
+            .into_iter()
+            .map(|route| RawRoute {
+                id: route.route_id.to_owned(),
+                name: route.route_short_name,
+                trips: trips_intermed
+                    .get(&route.route_id)
+                    .expect("Key corresponding to Route should be present in Trips-Hashmap")
+                    .to_owned(),
+            })
+            .collect();
+
+        println!("Extracting trips");
+        let trips = raw_routes
+            .iter()
+            .flat_map(|raw_route| raw_route.trips.clone())
+            .collect();
+
+        println!("Converting Routes");
+        let routes = raw_routes
+            .into_iter()
+            .flat_map(|raw_route| {
+                Vec::<Route>::from(raw_route)
+                    .into_iter()
+                    .map(Arc::new)
+                    .collect::<Vec<Arc<Route>>>()
+            })
+            .collect();
+
+        println!("Converting Transfers");
+        let transfers = value
+            .transfers
+            .into_iter()
+            .map(|transfer| {
+                Arc::new(Transfer {
+                    from: stop_by_id(transfer.from_stop_id, &stops),
+                    to: stop_by_id(transfer.to_stop_id, &stops),
+                    time: transfer.min_transfer_time,
+                })
+            })
+            .collect();
+
+        Self {
+            stops,
+            routes,
+            trips,
+            transfers,
+        }
+    }
 }
