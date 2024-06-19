@@ -1,3 +1,7 @@
+use std::sync::Arc;
+
+use crate::raptor::Raptor;
+
 mod data;
 mod error;
 mod gtfs;
@@ -37,7 +41,33 @@ fn main() {
     };
 
     println!("Creating timetable");
-    let timetable = data::Timetable::from(gtfs_timetable);
+    let timetable = Arc::new(data::Timetable::from(gtfs_timetable));
 
-    println!("Test: {:?}", timetable.stops);
+    println!("Searching for starting stop");
+    let starting_stop = timetable
+        .stops
+        .get("8530813")
+        .expect("Starting stop should exist");
+
+    println!("Searching for target stop");
+    let target_stop = timetable
+        .stops
+        .get("8574471")
+        .expect("Target stop should exist");
+
+    println!("Creating Raptor instance");
+    let mut raptor = Raptor::new(
+        Arc::clone(&timetable),
+        Arc::clone(starting_stop),
+        0,
+        Some(Arc::clone(target_stop)),
+    );
+
+    println!("Running Raptor");
+    raptor.run();
+
+    println!(
+        "Last round at target stop: {:?}",
+        raptor.rounds.last().unwrap().tau.get(target_stop).unwrap()
+    )
 }

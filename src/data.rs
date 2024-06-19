@@ -4,10 +4,11 @@ use std::{collections::HashMap, hash::Hash, sync::Arc};
 use crate::{error::ProcessingError, gtfs};
 
 pub type Time = u32;
+pub type ID = String;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Stop {
-    pub id: String,
+    pub id: ID,
     pub name: String,
 }
 
@@ -37,7 +38,7 @@ pub struct StopTime {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trip {
-    id: String,
+    id: ID,
     stop_times: Vec<Arc<StopTime>>,
 }
 
@@ -79,7 +80,7 @@ impl Trip {
 
 #[derive(Clone, Debug)]
 pub struct RawRoute {
-    pub id: String,
+    pub id: ID,
     pub name: String,
     pub trips: Vec<Arc<Trip>>,
 }
@@ -101,9 +102,9 @@ impl RawRoute {
 
 #[derive(Clone, Debug, Eq)]
 pub struct Route {
-    pub parent_id: String,
+    pub parent_id: ID,
     pub parent_name: String,
-    pub group_id: String,
+    pub group_id: ID,
     pub trips: Vec<Arc<Trip>>,
 }
 
@@ -205,19 +206,22 @@ impl Queue {
         Vec::<QueueItem>::from(self.clone())
     }
 
-    pub fn enqueue(marked_stops: &[Arc<Stop>], routes: &[Arc<Route>]) -> Self {
+    pub fn enqueue(
+        marked_stops: &[Arc<Stop>],
+        stops_for_routes: &HashMap<Arc<Route>, Vec<Arc<Stop>>>,
+    ) -> Self {
         let mut queue = Self::default();
 
         for marked_stop in marked_stops {
-            for route in routes
+            stops_for_routes
                 .iter()
-                .filter(|route| route.stops().contains(marked_stop))
-            {
-                queue.insert(QueueItem {
-                    route: Arc::clone(route),
-                    hop_stop: Arc::clone(marked_stop),
-                })
-            }
+                .filter(|(_, stops)| stops.contains(marked_stop))
+                .for_each(|(route, _)| {
+                    queue.insert(QueueItem {
+                        route: Arc::clone(route),
+                        hop_stop: Arc::clone(marked_stop),
+                    })
+                });
         }
 
         queue
@@ -233,34 +237,37 @@ pub struct Transfer {
 
 #[derive(Debug)]
 pub struct Timetable {
-    pub stops: Vec<Arc<Stop>>,
-    pub routes: Vec<Arc<Route>>,
+    pub stops: HashMap<ID, Arc<Stop>>,
+    pub routes: HashMap<ID, Arc<Route>>,
     pub trips: Vec<Arc<Trip>>,
     pub transfers: Vec<Arc<Transfer>>,
+}
+
+impl Timetable {
+    pub fn stops_for_routes(&self) -> HashMap<Arc<Route>, Vec<Arc<Stop>>> {
+        self.routes
+            .values()
+            .map(|route| (Arc::clone(route), route.stops()))
+            .collect()
+    }
 }
 
 impl From<gtfs::Timetable> for Timetable {
     fn from(value: gtfs::Timetable) -> Self {
         println!("Converting stops");
-        let stops: Vec<Arc<Stop>> = value
+        let stops: HashMap<ID, Arc<Stop>> = value
             .stops
             .into_iter()
             .map(|stop| {
-                Arc::new(Stop {
-                    id: stop.stop_id,
-                    name: stop.stop_name,
-                })
+                (
+                    stop.stop_id.to_owned(),
+                    Arc::new(Stop {
+                        id: stop.stop_id,
+                        name: stop.stop_name,
+                    }),
+                )
             })
             .collect();
-
-        let stop_by_id = |id: String, stops: &Vec<Arc<Stop>>| -> Arc<Stop> {
-            Arc::clone(
-                stops
-                    .iter()
-                    .find(|stop| stop.id == id)
-                    .expect("Stop not present in list of stops"),
-            )
-        };
 
         let time_to_seconds = |time: String| -> u32 {
             let components: Vec<String> = time.split(':').map(String::from).collect();
@@ -271,14 +278,18 @@ impl From<gtfs::Timetable> for Timetable {
         };
 
         println!("Calculating StopTimes-Hashmap");
-        let stop_times_intermed = value
+        let stop_times = value
             .stop_times
             .iter()
             .map(|stop_time| {
                 (
                     stop_time.trip_id.to_owned(),
                     Arc::new(StopTime {
-                        stop: stop_by_id(stop_time.stop_id.to_owned(), &stops),
+                        stop: Arc::clone(
+                            stops
+                                .get(&stop_time.stop_id)
+                                .expect("Stop should be present in HashMap"),
+                        ),
                         arrival_time: time_to_seconds(stop_time.arrival_time.to_owned()),
                         departure_time: time_to_seconds(stop_time.departure_time.to_owned()),
                     }),
@@ -287,7 +298,7 @@ impl From<gtfs::Timetable> for Timetable {
             .into_group_map();
 
         println!("Calculating Trips-Hashmap");
-        let trips_intermed =
+        let trips =
             value
                 .trips
                 .iter()
@@ -296,7 +307,7 @@ impl From<gtfs::Timetable> for Timetable {
                     trip.route_id.to_owned(),
                     Arc::new(Trip {
                         id: trip.trip_id.to_owned(),
-                        stop_times: stop_times_intermed.get(&trip.trip_id)
+                        stop_times: stop_times.get(&trip.trip_id)
 
                     .expect("Key corresponding to Trip should be present in StopTimes-Hashmap")
                     .to_owned(),
@@ -312,7 +323,7 @@ impl From<gtfs::Timetable> for Timetable {
             .map(|route| RawRoute {
                 id: route.route_id.to_owned(),
                 name: route.route_short_name,
-                trips: trips_intermed
+                trips: trips
                     .get(&route.route_id)
                     .expect("Key corresponding to Route should be present in Trips-Hashmap")
                     .to_owned(),
@@ -331,8 +342,8 @@ impl From<gtfs::Timetable> for Timetable {
             .flat_map(|raw_route| {
                 Vec::<Route>::from(raw_route)
                     .into_iter()
-                    .map(Arc::new)
-                    .collect::<Vec<Arc<Route>>>()
+                    .map(|route| (route.id(), Arc::new(route)))
+                    .collect::<HashMap<ID, Arc<Route>>>()
             })
             .collect();
 
@@ -342,8 +353,16 @@ impl From<gtfs::Timetable> for Timetable {
             .into_iter()
             .map(|transfer| {
                 Arc::new(Transfer {
-                    from: stop_by_id(transfer.from_stop_id, &stops),
-                    to: stop_by_id(transfer.to_stop_id, &stops),
+                    from: Arc::clone(
+                        stops
+                            .get(&transfer.from_stop_id)
+                            .expect("Stop should be in HashMap"),
+                    ),
+                    to: Arc::clone(
+                        stops
+                            .get(&transfer.to_stop_id)
+                            .expect("Stop should be in HashMap"),
+                    ),
                     time: transfer.min_transfer_time,
                 })
             })

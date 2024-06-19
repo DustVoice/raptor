@@ -7,6 +7,7 @@ pub type Tau = HashMap<Arc<Stop>, Time>;
 #[derive(Debug)]
 pub struct Raptor {
     pub timetable: Arc<Timetable>,
+    pub stops_for_routes: HashMap<Arc<Route>, Vec<Arc<Stop>>>,
 
     pub rounds: Vec<Round>,
     pub tau_min: Tau,
@@ -28,7 +29,8 @@ impl Raptor {
         target: Option<Arc<Stop>>,
     ) -> Self {
         Self {
-            timetable,
+            timetable: Arc::clone(&timetable),
+            stops_for_routes: timetable.stops_for_routes(),
             rounds: vec![Round {
                 tau: HashMap::from([(starting_stop.clone(), starting_time)]),
             }],
@@ -41,6 +43,7 @@ impl Raptor {
 
     pub fn run(&mut self) {
         while !self.is_finished() {
+            println!("Running Raptor round {:?}", self.rounds.len());
             self.round();
         }
     }
@@ -48,7 +51,10 @@ impl Raptor {
     pub fn round(&mut self) {
         let mut curr_round = Round::default();
 
-        for queue_item in Queue::enqueue(&self.marked_stops, &self.timetable.routes).as_vec() {
+        let queue = Queue::enqueue(&self.marked_stops, &self.stops_for_routes).as_vec();
+        self.marked_stops.clear();
+
+        for queue_item in queue {
             let mut current_trip: Option<Arc<Trip>> = None;
 
             for stop in queue_item.stops() {
@@ -68,7 +74,31 @@ impl Raptor {
                     } {
                         curr_round.tau.insert(Arc::clone(&stop), arr);
                         self.tau_min.insert(Arc::clone(&stop), arr);
-                        self.marked_stops.push(Arc::clone(&stop))
+                        self.marked_stops.push(Arc::clone(&stop));
+
+                        let faulty_stop = self.timetable.stops.get("8503059").unwrap();
+                        if stop.id == faulty_stop.id {
+                            println!(
+                                "Culprit stop {:?} found in round: {}",
+                                faulty_stop,
+                                self.rounds.len()
+                            );
+                            println!(
+                                "Stop {} found in curr_round.tau: {}",
+                                faulty_stop.id,
+                                curr_round.tau.contains_key(faulty_stop)
+                            );
+                            println!(
+                                "Stop {} found in tau_min: {}",
+                                faulty_stop.id,
+                                self.tau_min.contains_key(faulty_stop)
+                            );
+                            println!(
+                                "Stop {} found in marked_stops: {}",
+                                faulty_stop.id,
+                                self.marked_stops.contains(faulty_stop)
+                            );
+                        }
                     }
                 }
 
@@ -105,8 +135,12 @@ impl Raptor {
             .iter()
             .filter(|t| self.marked_stops.contains(&t.from))
         {
-            let transfer_time = curr_round.tau.get(&transfer.from).expect(
-                "Transfer.from must be present in Raptor.tau, as it is in Raptor.marked_stops",
+            let transfer_time = curr_round.tau.get(&transfer.from).unwrap_or_else(||
+                panic!("Transfer.from must be present in Raptor.tau, as it is in Raptor.marked_stops.\n-> Current Transfer: {:?}\n-> Marked Stops: {:?}\n-> Current Round Tau: {:?}",
+                    transfer,
+                    self.marked_stops.iter().map(|stop| stop.id.to_owned()).collect::<Vec<ID>>(),
+                    curr_round.tau.keys().map(|tau_stops| tau_stops.id.to_owned()).collect::<Vec<ID>>()
+                ),
             ) + transfer.time;
             curr_round.tau.insert(
                 Arc::clone(&transfer.to),
